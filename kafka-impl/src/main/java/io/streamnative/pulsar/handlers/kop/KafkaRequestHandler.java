@@ -109,6 +109,7 @@ import org.apache.kafka.common.message.CreateTopicsRequestData;
 import org.apache.kafka.common.message.DeleteGroupsRequestData;
 import org.apache.kafka.common.message.DeleteRecordsRequestData;
 import org.apache.kafka.common.message.DeleteTopicsRequestData;
+import org.apache.kafka.common.message.DescribeClusterResponseData;
 import org.apache.kafka.common.message.DescribeConfigsRequestData;
 import org.apache.kafka.common.message.DescribeConfigsResponseData;
 import org.apache.kafka.common.message.EndTxnRequestData;
@@ -147,6 +148,8 @@ import org.apache.kafka.common.requests.CreateTopicsRequest;
 import org.apache.kafka.common.requests.DeleteGroupsRequest;
 import org.apache.kafka.common.requests.DeleteRecordsRequest;
 import org.apache.kafka.common.requests.DeleteTopicsRequest;
+import org.apache.kafka.common.requests.DescribeClusterRequest;
+import org.apache.kafka.common.requests.DescribeClusterResponse;
 import org.apache.kafka.common.requests.DescribeConfigsRequest;
 import org.apache.kafka.common.requests.DescribeConfigsResponse;
 import org.apache.kafka.common.requests.DescribeGroupsRequest;
@@ -213,6 +216,9 @@ public class KafkaRequestHandler extends KafkaCommandDecoder {
     private final TenantContextManager tenantContextManager;
     private final ReplicaManager replicaManager;
     private final KopBrokerLookupManager kopBrokerLookupManager;
+
+    @Getter
+    private final LookupClient lookupClient;
     @Getter
     private final KafkaTopicManagerSharedState kafkaTopicManagerSharedState;
 
@@ -313,12 +319,14 @@ public class KafkaRequestHandler extends KafkaCommandDecoder {
                                boolean skipMessagesWithoutIndex,
                                RequestStats requestStats,
                                OrderedScheduler sendResponseScheduler,
-                               KafkaTopicManagerSharedState kafkaTopicManagerSharedState) throws Exception {
+                               KafkaTopicManagerSharedState kafkaTopicManagerSharedState,
+                               LookupClient lookupClient) throws Exception {
         super(requestStats, kafkaConfig, sendResponseScheduler);
         this.pulsarService = pulsarService;
         this.tenantContextManager = tenantContextManager;
         this.replicaManager = replicaManager;
         this.kopBrokerLookupManager = kopBrokerLookupManager;
+        this.lookupClient = lookupClient;
         this.clusterName = kafkaConfig.getClusterName();
         this.executor = pulsarService.getExecutor();
         this.admin = pulsarService.getAdminClient();
@@ -490,18 +498,6 @@ public class KafkaRequestHandler extends KafkaCommandDecoder {
             }
             return KafkaResponseUtils.newApiVersions(versionList);
         }
-    }
-
-    @Override
-    protected void handleError(KafkaHeaderAndRequest kafkaHeaderAndRequest,
-                               CompletableFuture<AbstractResponse> resultFuture) {
-        String err = String.format("Kafka API (%s) Not supported by kop server.",
-            kafkaHeaderAndRequest.getHeader().apiKey());
-        log.error(err);
-
-        AbstractResponse apiResponse = kafkaHeaderAndRequest.getRequest()
-            .getErrorResponse(new UnsupportedOperationException(err));
-        resultFuture.complete(apiResponse);
     }
 
     @Override
@@ -1657,7 +1653,7 @@ public class KafkaRequestHandler extends KafkaCommandDecoder {
                                 new FetchResponse<>(
                                     Errors.NONE,
                                     partitions,
-                                    THROTTLE_TIME_MS,
+                                    0,
                                     request.metadata().sessionId()),
                                 () -> resultMap.forEach((__, readRecordsResult) -> {
                                     readRecordsResult.recycle();
@@ -2099,6 +2095,31 @@ public class KafkaRequestHandler extends KafkaCommandDecoder {
             }
         });
 
+    }
+
+    @Override
+    protected void handleDescribeCluster(KafkaHeaderAndRequest describeConfigs,
+                                         CompletableFuture<AbstractResponse> resultFuture) {
+        checkArgument(describeConfigs.getRequest() instanceof DescribeClusterRequest);
+        DescribeClusterResponseData data = new DescribeClusterResponseData();
+        List<Node> allNodes = new ArrayList<>(adminManager.getBrokers(advertisedEndPoint.getListenerName()));
+
+        // Each Pulsar broker can manage metadata like controller in Kafka,
+        // Kafka's AdminClient needs to find a controller node for metadata management.
+        // So here we return an random broker as a controller for the given listenerName.
+        final int controllerId = adminManager.getControllerId(advertisedEndPoint.getListenerName());
+        DescribeClusterResponse response = new DescribeClusterResponse(data);
+        data.setControllerId(controllerId);
+        data.setClusterId(clusterName);
+        data.setErrorCode(Errors.NONE.code());
+        data.setErrorMessage(Errors.NONE.message());
+        allNodes.forEach(node -> {
+            data.brokers().add(new DescribeClusterResponseData.DescribeClusterBroker()
+                    .setBrokerId(node.id())
+                    .setHost(node.host())
+                    .setPort(node.port()));
+        });
+        resultFuture.complete(response);
     }
 
     @Override
